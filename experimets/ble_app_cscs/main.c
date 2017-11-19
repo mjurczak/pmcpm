@@ -89,6 +89,7 @@ static bool                             m_auto_calibration_in_progress;         
 
 static uint16_t 													gyro_crank_rev = 0;
 static uint32_t 													gyro_crank_deg_dec = 0;
+static uint16_t                           gyro_crank_avgRate = 0;
 
 static ble_sensor_location_t supported_locations[] = {BLE_SENSOR_LOCATION_FRONT_WHEEL ,
                                                       BLE_SENSOR_LOCATION_LEFT_CRANK  ,
@@ -166,13 +167,15 @@ static void gyro_meas_timeout_handler(void * p_context)
 	static uint16_t previousCrankRev = 0;
 	int16_t measuredRate;
 	uint16_t absoluteRate;
-	static uint16_t noUpdateCounter = 0;
+	static uint8_t avgRateSample = 0;
+	static uint32_t sampleSum = 0;
+	uint16_t sampleAvg;
 	
   nrf_gpio_pin_set(22);
 
 	measuredRate = mpu6050_read_gyro_z();
-
-  if(measuredRate > 0)
+	
+  if(measuredRate > 5)
 	{
 		nrf_gpio_pin_set(21);
 		absoluteRate = measuredRate;
@@ -180,24 +183,26 @@ static void gyro_meas_timeout_handler(void * p_context)
 	else
 	{
 		nrf_gpio_pin_clear(21);
-		absoluteRate = measuredRate * -1;
+		absoluteRate = 0;
 	}
+	
+	sampleSum += absoluteRate;
+	avgRateSample++;
 	
 	gyro_crank_deg_dec += absoluteRate;
 	// Convert cumulative 0.1 degrees to revolutions
 	gyro_crank_rev = gyro_crank_deg_dec / 3600;
 	
 	
-	if ( gyro_crank_rev != previousCrankRev || noUpdateCounter > 30)
+	if ( avgRateSample == 10)
 	{
+		sampleAvg = sampleSum / avgRateSample;
+		gyro_crank_avgRate = sampleAvg;
 		csc_meas_timeout_handler(NULL);
-		noUpdateCounter = 0;
+		avgRateSample = 0;
+		sampleSum = 0;
 	}
-	else
-	{
-		noUpdateCounter++;
-	}
-	
+
 	previousCrankRev = gyro_crank_rev;
 	
 	nrf_gpio_pin_clear(22);
@@ -208,27 +213,39 @@ static void gyro_meas_timeout_handler(void * p_context)
  */
 static void csc_sim_measurement(ble_cscs_meas_t * p_measurement)
 {
-    static uint32_t last_ticks            = 0;
+	  static uint16_t fakeRevs = 0;
 		uint32_t current_ticks;
 	  uint16_t event_time;
+	  static uint16_t lastEventTime = 0;
 	
 	  // Get current ticks
-		app_timer_cnt_get(&current_ticks);
+		//app_timer_cnt_get(&current_ticks);
 	
-    APP_TIMER_TICKS(1000, APP_TIMER_PRESCALER);
+    //APP_TIMER_TICKS(1000, APP_TIMER_PRESCALER);
 	  
 	  // Per specification event time is in 1/1024th's of a second.
-	  event_time = (current_ticks * 1024) / APP_TIMER_TICKS(1000, APP_TIMER_PRESCALER);
+	  //event_time = (current_ticks * 1024) / APP_TIMER_TICKS(1000, APP_TIMER_PRESCALER);
 
     // Indicate no wheel data present.
     p_measurement->is_wheel_rev_data_present = false;
 
-    // Calculate simulated cadence values.
+    // Calculate cadence value from average rate
     p_measurement->is_crank_rev_data_present = true;
 
-    p_measurement->cumulative_crank_revs = gyro_crank_rev;
+	  if ( gyro_crank_avgRate > 0)
+		{
+	    event_time = lastEventTime + ((1024*360) / gyro_crank_avgRate);
+			fakeRevs++;
+	  }
+		else
+		{
+			event_time = lastEventTime + 1024;
+		}
+			
+    p_measurement->cumulative_crank_revs = fakeRevs;
     p_measurement->last_crank_event_time = event_time;
-
+		
+		lastEventTime = event_time;
 }
 
 
@@ -244,11 +261,12 @@ static void csc_meas_timeout_handler(void * p_context)
 {
     uint32_t        err_code;
     ble_cscs_meas_t cscs_measurement;
-
+		uint16_t        avgRate;
+	
     UNUSED_PARAMETER(p_context);
 	
 		nrf_gpio_pin_set(20);
-
+	
     csc_sim_measurement(&cscs_measurement);
 
     err_code = ble_cscs_measurement_send(&m_cscs, &cscs_measurement);
