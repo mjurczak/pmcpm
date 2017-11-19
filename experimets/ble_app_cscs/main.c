@@ -10,21 +10,6 @@
  *
  */
 
-/** @file
- *
- * @defgroup ble_sdk_app_csc_main main.c
- * @{
- * @ingroup ble_sdk_app_csc
- * @brief Cycling Speed and Cadence Service Sample Application main file.
- *
- * This file contains the source code for a sample application using the Cycling Speed and Cadence
- * Service.
- * It also includes the sample code for Battery and Device Information services.
- * This application uses the @ref srvlib_conn_params module.
- *
- * This application implements supports for both Wheel revolution Data and Crank Revolution Data.
- * In addition, this application also has support for all 'Speed and Cadence Control Point'.
- */
 #include <stdint.h>
 #include <string.h>
 #include "nordic_common.h"
@@ -67,19 +52,7 @@
 
 #define SPEED_AND_CADENCE_MEAS_INTERVAL 1000                                       /**< Speed and cadence measurement interval (milliseconds). */
 
-#define WHEEL_CIRCUMFERENCE_MM          2100                                       /**< Simulated wheel circumference in millimeters. */
-#define KPH_TO_MM_PER_SEC               278                                        /**< Constant to convert kilometers per hour into millimeters per second. */
 
-#define MIN_SPEED_KPH                   10                                         /**< Minimum speed in kilometers per hour for use in the simulated measurement function. */
-#define MAX_SPEED_KPH                   40                                         /**< Maximum speed in kilometers per hour for use in the simulated measurement function. */
-#define SPEED_KPH_INCREMENT             1                                          /**< Value by which speed is incremented/decremented for each call to the simulated measurement function. */
-
-#define DEGREES_PER_REVOLUTION          360                                        /**< Constant used in simulation for calculating crank speed. */
-#define RPM_TO_DEGREES_PER_SEC          6                                          /**< Constant to convert revolutions per minute into degrees per second. */
-
-#define MIN_CRANK_RPM                   20                                         /**< Minimum cadence in RPM for use in the simulated measurement function. */
-#define MAX_CRANK_RPM                   110                                        /**< Maximum cadence in RPM for use in the simulated measurement function. */
-#define CRANK_RPM_INCREMENT             3                                          /**< Value by which cadence is incremented/decremented in the simulated measurement function. */
 
 #define MIN_CONN_INTERVAL               MSEC_TO_UNITS(500, UNIT_1_25_MS)           /**< Minimum acceptable connection interval (0.5 seconds). */
 #define MAX_CONN_INTERVAL               MSEC_TO_UNITS(1000, UNIT_1_25_MS)          /**< Maximum acceptable connection interval (1 second). */
@@ -107,22 +80,15 @@ static ble_cscs_t                       m_cscs;                                 
 static sensorsim_cfg_t                  m_battery_sim_cfg;                         /**< Battery Level sensor simulator configuration. */
 static sensorsim_state_t                m_battery_sim_state;                       /**< Battery Level sensor simulator state. */
 
-static sensorsim_cfg_t                  m_speed_kph_sim_cfg;                       /**< Speed simulator configuration. */
-static sensorsim_state_t                m_speed_kph_sim_state;                     /**< Speed simulator state. */
-static sensorsim_cfg_t                  m_crank_rpm_sim_cfg;                       /**< Crank simulator configuration. */
-static sensorsim_state_t                m_crank_rpm_sim_state;                     /**< Crank simulator state. */
 
 APP_TIMER_DEF(m_battery_timer_id);                                                 /**< Battery timer. */
-APP_TIMER_DEF(m_csc_meas_timer_id);                                                /**< CSC measurement timer. */
 APP_TIMER_DEF(m_gyro_timer_id);                                                    /**< Gyroscope measurement timer. */
 
 static dm_application_instance_t        m_app_handle;                              /**< Application identifier allocated by device manager. */
-static uint32_t                         m_cumulative_wheel_revs;                   /**< Cumulative wheel revolutions. */
 static bool                             m_auto_calibration_in_progress;            /**< Set when an autocalibration is in progress. */
 
-static int32_t 													gyro_crank_rev = 0;
-static int32_t													gyro_crank_deg = 0;
-static int32_t													gyro_crank_deg_dec = 0;
+static uint16_t 													gyro_crank_rev = 0;
+static uint32_t 													gyro_crank_deg_dec = 0;
 
 static ble_sensor_location_t supported_locations[] = {BLE_SENSOR_LOCATION_FRONT_WHEEL ,
                                                       BLE_SENSOR_LOCATION_LEFT_CRANK  ,
@@ -139,6 +105,9 @@ static ble_uuid_t m_adv_uuids[] = {{BLE_UUID_CYCLING_SPEED_AND_CADENCE,  BLE_UUI
                                    {BLE_UUID_BATTERY_SERVICE,            BLE_UUID_TYPE_BLE},
                                    {BLE_UUID_DEVICE_INFORMATION_SERVICE, BLE_UUID_TYPE_BLE}}; /**< Universally unique service identifiers. */
 
+																	 
+static void csc_meas_timeout_handler(void * p_context);
+																	 
 /**@brief Callback function for asserts in the SoftDevice.
  *
  * @details This function will be called in case of an assert in the SoftDevice.
@@ -194,8 +163,10 @@ static void battery_level_meas_timeout_handler(void * p_context)
 static void gyro_meas_timeout_handler(void * p_context)
 {
 	
+	static uint16_t previousCrankRev = 0;
 	int16_t measuredRate;
 	uint16_t absoluteRate;
+	static uint16_t noUpdateCounter = 0;
 	
   nrf_gpio_pin_set(22);
 
@@ -213,17 +184,21 @@ static void gyro_meas_timeout_handler(void * p_context)
 	}
 	
 	gyro_crank_deg_dec += absoluteRate;
-	//gyro_crang_deg = gyro_crank_deg_dec / 10;
+	// Convert cumulative 0.1 degrees to revolutions
 	gyro_crank_rev = gyro_crank_deg_dec / 3600;
 	
-	if (absoluteRate > 90)
+	
+	if ( gyro_crank_rev != previousCrankRev || noUpdateCounter > 30)
 	{
-		nrf_gpio_pin_set(20);
+		csc_meas_timeout_handler(NULL);
+		noUpdateCounter = 0;
 	}
 	else
 	{
-		nrf_gpio_pin_clear(20);
+		noUpdateCounter++;
 	}
+	
+	previousCrankRev = gyro_crank_rev;
 	
 	nrf_gpio_pin_clear(22);
 }
@@ -233,47 +208,27 @@ static void gyro_meas_timeout_handler(void * p_context)
  */
 static void csc_sim_measurement(ble_cscs_meas_t * p_measurement)
 {
-    static uint16_t cumulative_crank_revs = 0;
-    static uint16_t event_time            = 0;
-    static uint16_t wheel_revolution_mm   = 0;
-    static uint16_t crank_rev_degrees     = 0;
+    static uint32_t last_ticks            = 0;
+		uint32_t current_ticks;
+	  uint16_t event_time;
+	
+	  // Get current ticks
+		app_timer_cnt_get(&current_ticks);
+	
+    APP_TIMER_TICKS(1000, APP_TIMER_PRESCALER);
+	  
+	  // Per specification event time is in 1/1024th's of a second.
+	  event_time = (current_ticks * 1024) / APP_TIMER_TICKS(1000, APP_TIMER_PRESCALER);
 
-    uint16_t mm_per_sec;
-    uint16_t degrees_per_sec;
-    uint16_t event_time_inc;
-
-    // Per specification event time is in 1/1024th's of a second.
-    event_time_inc = (1024 * SPEED_AND_CADENCE_MEAS_INTERVAL) / 1000;
-
-    // Calculate simulated wheel revolution values.
-    p_measurement->is_wheel_rev_data_present = true;
-
-    mm_per_sec = KPH_TO_MM_PER_SEC * sensorsim_measure(&m_speed_kph_sim_state,
-                                                           &m_speed_kph_sim_cfg);
-
-    wheel_revolution_mm     += mm_per_sec * SPEED_AND_CADENCE_MEAS_INTERVAL / 1000;
-    m_cumulative_wheel_revs += wheel_revolution_mm / WHEEL_CIRCUMFERENCE_MM;
-    wheel_revolution_mm     %= WHEEL_CIRCUMFERENCE_MM;
-
-    p_measurement->cumulative_wheel_revs = m_cumulative_wheel_revs;
-    p_measurement->last_wheel_event_time =
-        event_time + (event_time_inc * (mm_per_sec - wheel_revolution_mm) / mm_per_sec);
+    // Indicate no wheel data present.
+    p_measurement->is_wheel_rev_data_present = false;
 
     // Calculate simulated cadence values.
     p_measurement->is_crank_rev_data_present = true;
 
-    degrees_per_sec = RPM_TO_DEGREES_PER_SEC * sensorsim_measure(&m_crank_rpm_sim_state,
-                                                                     &m_crank_rpm_sim_cfg);
-
-    crank_rev_degrees     += degrees_per_sec * SPEED_AND_CADENCE_MEAS_INTERVAL / 1000;
-    cumulative_crank_revs += crank_rev_degrees / DEGREES_PER_REVOLUTION;
-    crank_rev_degrees     %= DEGREES_PER_REVOLUTION;
-
     p_measurement->cumulative_crank_revs = gyro_crank_rev;
-    p_measurement->last_crank_event_time =
-        event_time + (event_time_inc * (degrees_per_sec - crank_rev_degrees) / degrees_per_sec);
+    p_measurement->last_crank_event_time = event_time;
 
-    event_time += event_time_inc;
 }
 
 
@@ -291,6 +246,8 @@ static void csc_meas_timeout_handler(void * p_context)
     ble_cscs_meas_t cscs_measurement;
 
     UNUSED_PARAMETER(p_context);
+	
+		nrf_gpio_pin_set(20);
 
     csc_sim_measurement(&cscs_measurement);
 
@@ -318,6 +275,8 @@ static void csc_meas_timeout_handler(void * p_context)
             m_auto_calibration_in_progress = false;
         }
     }
+		
+		nrf_gpio_pin_clear(20);
 }
 
 
@@ -338,12 +297,6 @@ static void timers_init(void)
                                 battery_level_meas_timeout_handler);
     APP_ERROR_CHECK(err_code);
 
-    // Create battery timer.
-    err_code = app_timer_create(&m_csc_meas_timer_id,
-                                APP_TIMER_MODE_REPEATED,
-                                csc_meas_timeout_handler);
-    APP_ERROR_CHECK(err_code);
-	
 	  // Create gyro measurement timer.
     err_code = app_timer_create(&m_gyro_timer_id,
                                 APP_TIMER_MODE_REPEATED,
@@ -397,10 +350,6 @@ ble_scpt_response_t sc_ctrlpt_event_handler(ble_sc_ctrlpt_t     * p_sc_ctrlpt,
 {
     switch (p_evt->evt_type)
     {
-        case BLE_SC_CTRLPT_EVT_SET_CUMUL_VALUE:
-            m_cumulative_wheel_revs = p_evt->params.cumulative_value;
-            break;
-
         case BLE_SC_CTRLPT_EVT_START_CALIBRATION:
             m_auto_calibration_in_progress = true;
             break;
@@ -483,53 +432,17 @@ static void services_init(void)
 }
 
 
-/**@brief Function for initializing the sensor simulators.
- */
-static void sensor_simulator_init(void)
-{
-    m_battery_sim_cfg.min          = MIN_BATTERY_LEVEL;
-    m_battery_sim_cfg.max          = MAX_BATTERY_LEVEL;
-    m_battery_sim_cfg.incr         = BATTERY_LEVEL_INCREMENT;
-    m_battery_sim_cfg.start_at_max = true;
-
-    sensorsim_init(&m_battery_sim_state, &m_battery_sim_cfg);
-
-    m_speed_kph_sim_cfg.min          = MIN_SPEED_KPH;
-    m_speed_kph_sim_cfg.max          = MAX_SPEED_KPH;
-    m_speed_kph_sim_cfg.incr         = SPEED_KPH_INCREMENT;
-    m_speed_kph_sim_cfg.start_at_max = false;
-
-    sensorsim_init(&m_speed_kph_sim_state, &m_speed_kph_sim_cfg);
-
-    m_crank_rpm_sim_cfg.min          = MIN_CRANK_RPM;
-    m_crank_rpm_sim_cfg.max          = MAX_CRANK_RPM;
-    m_crank_rpm_sim_cfg.incr         = CRANK_RPM_INCREMENT;
-    m_crank_rpm_sim_cfg.start_at_max = false;
-
-    sensorsim_init(&m_crank_rpm_sim_state, &m_crank_rpm_sim_cfg);
-
-    m_cumulative_wheel_revs        = 0;
-    m_auto_calibration_in_progress = false;
-}
-
-
 /**@brief Function for starting application timers.
  */
 static void application_timers_start(void)
 {
     uint32_t err_code;
-    uint32_t csc_meas_timer_ticks;
     uint32_t gyro_meas_timer_ticks;
 
     // Start application timers.
     err_code = app_timer_start(m_battery_timer_id, BATTERY_LEVEL_MEAS_INTERVAL, NULL);
     APP_ERROR_CHECK(err_code);
 
-    csc_meas_timer_ticks = APP_TIMER_TICKS(SPEED_AND_CADENCE_MEAS_INTERVAL, APP_TIMER_PRESCALER);
-
-    err_code = app_timer_start(m_csc_meas_timer_id, csc_meas_timer_ticks, NULL);
-    APP_ERROR_CHECK(err_code);
-	
 	  gyro_meas_timer_ticks = APP_TIMER_TICKS(100, APP_TIMER_PRESCALER);
 
     err_code = app_timer_start(m_gyro_timer_id, gyro_meas_timer_ticks, NULL);
@@ -764,40 +677,6 @@ static void ble_stack_init(void)
 }
 
 
-/**@brief Function for handling events from the BSP module.
- *
- * @param[in]   event   Event generated by button press.
- */
-static void bsp_event_handler(bsp_event_t event)
-{
-    uint32_t err_code;
-    switch (event)
-    {
-        case BSP_EVENT_SLEEP:
-            sleep_mode_enter();
-            break;
-
-        case BSP_EVENT_DISCONNECT:
-            err_code = sd_ble_gap_disconnect(m_conn_handle, BLE_HCI_REMOTE_USER_TERMINATED_CONNECTION);
-            if (err_code != NRF_ERROR_INVALID_STATE)
-            {
-                APP_ERROR_CHECK(err_code);
-            }
-            break;
-
-        case BSP_EVENT_WHITELIST_OFF:
-            err_code = ble_advertising_restart_without_whitelist();
-            if (err_code != NRF_ERROR_INVALID_STATE)
-            {
-                APP_ERROR_CHECK(err_code);
-            }
-            break;
-
-        default:
-            break;
-    }
-}
-
 
 /**@brief Function for handling the Device Manager events.
  *
@@ -872,26 +751,6 @@ static void advertising_init(void)
 }
 
 
-/**@brief Function for initializing buttons and leds.
- *
- * @param[out] p_erase_bonds  Will be true if the clear bonding button was pressed to wake the application up.
- */
-static void buttons_leds_init(bool * p_erase_bonds)
-{
-    bsp_event_t startup_event;
-
-    uint32_t err_code = bsp_init(BSP_INIT_LED | BSP_INIT_BUTTONS,
-                                 APP_TIMER_TICKS(100, APP_TIMER_PRESCALER),
-                                 bsp_event_handler);
-    APP_ERROR_CHECK(err_code);
-
-    err_code = bsp_btn_ble_init(NULL, &startup_event);
-    APP_ERROR_CHECK(err_code);
-
-    *p_erase_bonds = (startup_event == BSP_EVENT_CLEAR_BONDING_DATA);
-}
-
-
 /**@brief Function for the Power manager.
  */
 static void power_manage(void)
@@ -900,7 +759,7 @@ static void power_manage(void)
     APP_ERROR_CHECK(err_code);
 }
 
-
+ 
 static void leds_init(void)
 {
 	nrf_gpio_cfg_output(22);
@@ -929,8 +788,7 @@ int main(void)
     services_init();
 	 
 	  mpu6050_init();
-	
-    sensor_simulator_init();
+
     conn_params_init();
 
     // Start execution.
